@@ -165,7 +165,7 @@ static const struct consw fb_con;
 
 #define advance_row(p, delta) (unsigned short *)((unsigned long)(p) + (delta) * vc->vc_size_row)
 
-static int fbcon_cursor_noblink;
+static int fbcon_cursor_noblink = 1;
 
 #define divides(a, b)	((!(a) || (b)%(a)) ? 0 : 1)
 
