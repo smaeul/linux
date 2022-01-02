@@ -2700,6 +2700,9 @@ static int _regulator_do_enable(struct regulator_dev *rdev)
 		if (time_remaining <= 0) {
 			rdev_err(rdev, "Enabled check timed out\n");
 			return -ETIMEDOUT;
+		} else {
+			rdev_info(rdev, "Enabled after %d of %d us\n",
+				  delay - time_remaining, delay);
 		}
 	} else {
 		_regulator_delay_helper(delay);
