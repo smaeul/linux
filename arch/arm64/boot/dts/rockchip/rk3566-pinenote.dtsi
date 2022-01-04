@@ -5,6 +5,7 @@
 #include <dt-bindings/input/input.h>
 #include <dt-bindings/leds/common.h>
 #include <dt-bindings/pinctrl/rockchip.h>
+#include <dt-bindings/suspend/rockchip-rk3568.h>
 
 #include "rk3566.dtsi"
 
@@ -127,6 +128,28 @@
 				remote-endpoint = <&ebc_out_panel>;
 			};
 		};
+	};
+
+	rockchip-suspend {
+		compatible = "rockchip,pm-rk3568";
+		status = "okay";
+		rockchip,sleep-debug-en = <0>;
+		rockchip,sleep-mode-config = <
+			(0
+			| RKPM_SLP_CENTER_OFF
+			| RKPM_SLP_ARMOFF_LOGOFF
+			| RKPM_SLP_PMIC_LP
+			| RKPM_SLP_HW_PLLS_OFF
+			| RKPM_SLP_PMUALIVE_32K
+			| RKPM_SLP_OSC_DIS
+			| RKPM_SLP_32K_PVTM
+			)
+		>;
+		rockchip,wakeup-config = <
+			(0
+			| RKPM_GPIO_WKUP_EN
+			)
+		>;
 	};
 
 	sdio_pwrseq: sdio-pwrseq {
