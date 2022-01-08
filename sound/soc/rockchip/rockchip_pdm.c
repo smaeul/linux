@@ -614,10 +614,6 @@ static int rockchip_pdm_probe(struct platform_device *pdev)
 	if (IS_ERR(pdm->hclk))
 		return PTR_ERR(pdm->hclk);
 
-	ret = clk_prepare_enable(pdm->hclk);
-	if (ret)
-		return ret;
-
 	pm_runtime_enable(&pdev->dev);
 	if (!pm_runtime_enabled(&pdev->dev)) {
 		ret = rockchip_pdm_runtime_resume(&pdev->dev);
@@ -654,21 +650,14 @@ err_suspend:
 err_pm_disable:
 	pm_runtime_disable(&pdev->dev);
 
-	clk_disable_unprepare(pdm->hclk);
-
 	return ret;
 }
 
 static int rockchip_pdm_remove(struct platform_device *pdev)
 {
-	struct rk_pdm_dev *pdm = dev_get_drvdata(&pdev->dev);
-
 	pm_runtime_disable(&pdev->dev);
 	if (!pm_runtime_status_suspended(&pdev->dev))
 		rockchip_pdm_runtime_suspend(&pdev->dev);
-
-	clk_disable_unprepare(pdm->clk);
-	clk_disable_unprepare(pdm->hclk);
 
 	return 0;
 }
