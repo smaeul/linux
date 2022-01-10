@@ -902,4 +902,12 @@ config INPUT_STPMIC1_ONKEY
 	  To compile this driver as a module, choose M here: the
 	  module will be called stpmic1_onkey.
 
+config INPUT_WS8100_PEN
+	tristate "Wisesun WS8100 BLE Pen support"
+	depends on SPI
+	help
+	  Say Y to enable support for the buttons on Bluetooth LE pens
+	  connected via a Wisesun WS8100 BLE controller, such as used on the
+	  Pine64 PineNote.
+
 endif
