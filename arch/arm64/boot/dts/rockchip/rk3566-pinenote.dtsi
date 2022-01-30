@@ -311,6 +311,11 @@
 	};
 };
 
+&gpu {
+	mali-supply = <&vdd_gpu_npu>;
+	// status = "okay";
+};
+
 &i2c0 {
 	status = "okay";
 
