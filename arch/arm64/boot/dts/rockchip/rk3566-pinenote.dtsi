@@ -150,6 +150,33 @@
 		};
 	};
 
+	spi-gpio {
+		compatible = "spi-gpio";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		pinctrl-0 = <&ble_spi_pins>;
+		pinctrl-names = "default";
+		mosi-gpios = <&gpio3 RK_PC1 GPIO_ACTIVE_HIGH>;
+		sck-gpios = <&gpio3 RK_PC3 GPIO_ACTIVE_HIGH>;
+		num-chipselects = <0>;
+		status = "okay";
+
+		/* TODO: write binding */
+		bluetooth@0 {
+			compatible = "pine64,pinenote-ws8100-pen";
+			reg = <0>;
+			cs-gpios = <&gpio3 RK_PC2 GPIO_ACTIVE_HIGH>;
+			host_state-gpios = <&gpio1 RK_PD6 GPIO_ACTIVE_HIGH>;
+			interrupt-parent = <&gpio0>;
+			interrupts = <RK_PB5 IRQ_TYPE_EDGE_RISING>;
+			pinctrl-0 = <&ble_host_state_h>, <&ble_int_l>, <&ble_rst_h>;
+			pinctrl-names = "default";
+			reset-gpios = <&gpio3 RK_PC0 GPIO_ACTIVE_HIGH>;
+			spi-3wire;
+			spi-max-frequency = <10000>;
+		};
+	};
+
 	vbat_4g: vbat-4g {
 		compatible = "regulator-fixed";
 		regulator-name = "vbat_4g";
@@ -574,6 +601,29 @@
 	backlight {
 		backlight_hwen_h: backlight-hwen-h {
 			rockchip,pins = <0 RK_PB7 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	ble {
+		ble_host_state_h: ble-host-state-h {
+			rockchip,pins = <1 RK_PD6 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		ble_int_l: ble-int-l {
+			rockchip,pins = <0 RK_PB5 RK_FUNC_GPIO &pcfg_pull_down>;
+		};
+
+		ble_rst_h: ble-rst-h {
+			rockchip,pins = <3 RK_PC0 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		ble_spi_pins: ble-spi-pins {
+			rockchip,pins = /* data */
+					<3 RK_PC1 RK_FUNC_GPIO &pcfg_pull_none>,
+					/* cs */
+					<3 RK_PC2 RK_FUNC_GPIO &pcfg_pull_none>,
+					/* clk */
+					<3 RK_PC3 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 	};
 
