@@ -57,6 +57,32 @@
 				       <3710000 15>, <3680000 10>, <3670000  5>, <3500000  0>;
 	};
 
+	bt_sco_codec: bt-sco-codec {
+		compatible = "linux,bt-sco";
+		#sound-dai-cells = <1>;
+	};
+
+	bt-sound {
+		compatible = "simple-audio-card";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		simple-audio-card,name = "PineNote Bluetooth";
+
+		simple-audio-card,dai-link@0 {
+			format = "i2s";
+			frame-master = <&bt_link0_cpu>;
+			bitclock-master = <&bt_link0_cpu>;
+
+			bt_link0_cpu: cpu {
+				sound-dai = <&i2s2_2ch>;
+			};
+
+			bt_link0_codec: codec {
+				sound-dai = <&bt_sco_codec 0>;
+			};
+		};
+	};
+
 	dmic_codec: dmic-codec {
 		compatible = "dmic-codec";
 		num-channels = <6>;
@@ -574,6 +600,11 @@
 
 &i2s1_8ch {
 	pinctrl-0 = <&i2s1m0_lrcktx>, <&i2s1m0_sclktx>, <&i2s1m0_sdi0>, <&i2s1m0_sdo0>;
+	rockchip,trcm-sync-tx-only;
+	status = "okay";
+};
+
+&i2s2_2ch {
 	rockchip,trcm-sync-tx-only;
 	status = "okay";
 };
