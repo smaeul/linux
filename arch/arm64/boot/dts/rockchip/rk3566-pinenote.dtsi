@@ -596,6 +596,18 @@
 		vdd-supply = <&vcc_3v3>;
 		vddio-supply = <&vcc_3v3>;
 	};
+
+	touchscreen@24 {
+		compatible = "cypress,tt21000";
+		hid-descr-addr = <0x1>;
+		reg = <0x24>;
+		interrupt-parent = <&gpio0>;
+		interrupts = <RK_PA6 IRQ_TYPE_LEVEL_LOW>;
+		pinctrl-0 = <&ts_int_l>, <&ts_rst_l>;
+		pinctrl-names = "default";
+		reset-gpios = <&gpio0 RK_PA5 GPIO_ACTIVE_LOW>;
+		vdd-supply = <&vcc_3v3_pmu>;
+	};
 };
 
 &i2s1_8ch {
@@ -717,6 +729,16 @@
 	tcpc {
 		tcpc_int_l: tcpc-int-l {
 			rockchip,pins = <0 RK_PA4 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+	};
+
+	touchscreen {
+		ts_int_l: ts-int-l {
+			rockchip,pins = <0 RK_PA6 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+
+		ts_rst_l: ts-rst-l {
+			rockchip,pins = <0 RK_PA5 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 	};
 
