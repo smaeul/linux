@@ -6,6 +6,7 @@
 #include <linux/clk.h>
 #include <linux/completion.h>
 #include <linux/irq.h>
+#include <linux/kthread.h>
 #include <linux/module.h>
 #include <linux/of_platform.h>
 #include <linux/pm_runtime.h>
@@ -135,8 +136,14 @@ struct rockchip_ebc {
 	struct drm_plane		plane;
 	struct regmap			*regmap;
 	struct regulator_bulk_data	supplies[EBC_NUM_SUPPLIES];
+	struct task_struct		*refresh_thread;
 	u32				dsp_start;
+	bool				reset_complete;
 };
+
+static bool skip_reset;
+module_param(skip_reset, bool, 0444);
+MODULE_PARM_DESC(skip_reset, "skip the initial display reset");
 
 DEFINE_DRM_GEM_FOPS(rockchip_ebc_fops);
 
@@ -170,6 +177,42 @@ static inline struct ebc_crtc_state *
 to_ebc_crtc_state(struct drm_crtc_state *crtc_state)
 {
 	return container_of(crtc_state, struct ebc_crtc_state, base);
+}
+
+static int rockchip_ebc_refresh_thread(void *data)
+{
+	struct rockchip_ebc *ebc = data;
+
+	while (!kthread_should_stop()) {
+		/*
+		 * LUTs use both the old and the new pixel values as inputs.
+		 * However, the initial contents of the display are unknown.
+		 * The special RESET waveform will initialize the display to
+		 * known contents (white) regardless of its current contents.
+		 */
+		if (!ebc->reset_complete) {
+			ebc->reset_complete = true;
+			drm_dbg(&ebc->drm, "display reset\n");
+		}
+
+		while (!kthread_should_park()) {
+			drm_dbg(&ebc->drm, "display update\n");
+
+			set_current_state(TASK_IDLE);
+			schedule();
+			__set_current_state(TASK_RUNNING);
+		}
+
+		/*
+		 * Clear the display before disabling the CRTC. Use the
+		 * highest-quality waveform to minimize visible artifacts.
+		 */
+		drm_dbg(&ebc->drm, "display clear\n");
+
+		kthread_parkme();
+	}
+
+	return 0;
 }
 
 static inline struct rockchip_ebc *crtc_to_ebc(struct drm_crtc *crtc)
@@ -296,11 +339,23 @@ static void rockchip_ebc_crtc_atomic_flush(struct drm_crtc *crtc,
 static void rockchip_ebc_crtc_atomic_enable(struct drm_crtc *crtc,
 					    struct drm_atomic_state *state)
 {
+	struct rockchip_ebc *ebc = crtc_to_ebc(crtc);
+	struct drm_crtc_state *crtc_state;
+
+	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+	if (crtc_state->mode_changed)
+		kthread_unpark(ebc->refresh_thread);
 }
 
 static void rockchip_ebc_crtc_atomic_disable(struct drm_crtc *crtc,
 					     struct drm_atomic_state *state)
 {
+	struct rockchip_ebc *ebc = crtc_to_ebc(crtc);
+	struct drm_crtc_state *crtc_state;
+
+	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+	if (crtc_state->mode_changed)
+		kthread_park(ebc->refresh_thread);
 }
 
 static const struct drm_crtc_helper_funcs rockchip_ebc_crtc_helper_funcs = {
@@ -408,6 +463,14 @@ static int rockchip_ebc_plane_atomic_check(struct drm_plane *plane,
 static void rockchip_ebc_plane_atomic_update(struct drm_plane *plane,
 					     struct drm_atomic_state *state)
 {
+	struct rockchip_ebc *ebc = plane_to_ebc(plane);
+	struct drm_plane_state *plane_state;
+
+	plane_state = drm_atomic_get_new_plane_state(state, plane);
+	if (!plane_state->crtc)
+		return;
+
+	wake_up_process(ebc->refresh_thread);
 }
 
 static const struct drm_plane_helper_funcs rockchip_ebc_plane_helper_funcs = {
@@ -673,6 +736,7 @@ static int rockchip_ebc_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, ebc);
 	init_completion(&ebc->display_end);
+	ebc->reset_complete = skip_reset;
 
 	base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(base))
@@ -716,12 +780,26 @@ static int rockchip_ebc_probe(struct platform_device *pdev)
 			return ret;
 	}
 
+	ebc->refresh_thread = kthread_create(rockchip_ebc_refresh_thread,
+					     ebc, "ebc-refresh/%s",
+					     dev_name(dev));
+	if (IS_ERR(ebc->refresh_thread)) {
+		ret = dev_err_probe(dev, PTR_ERR(ebc->refresh_thread),
+				    "Failed to start refresh thread\n");
+		goto err_disable_pm;
+	}
+
+	kthread_park(ebc->refresh_thread);
+	sched_set_fifo(ebc->refresh_thread);
+
 	ret = rockchip_ebc_drm_init(ebc);
 	if (ret)
-		goto err_disable_pm;
+		goto err_stop_kthread;
 
 	return 0;
 
+err_stop_kthread:
+	kthread_stop(ebc->refresh_thread);
 err_disable_pm:
 	pm_runtime_disable(dev);
 	if (!pm_runtime_status_suspended(dev))
@@ -737,6 +815,8 @@ static int rockchip_ebc_remove(struct platform_device *pdev)
 
 	drm_dev_unregister(&ebc->drm);
 	drm_atomic_helper_shutdown(&ebc->drm);
+
+	kthread_stop(ebc->refresh_thread);
 
 	pm_runtime_disable(dev);
 	if (!pm_runtime_status_suspended(dev))
