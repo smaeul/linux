@@ -12,6 +12,17 @@
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 
+#include <drm/drm_atomic.h>
+#include <drm/drm_atomic_helper.h>
+#include <drm/drm_bridge.h>
+#include <drm/drm_drv.h>
+#include <drm/drm_fb_helper.h>
+#include <drm/drm_gem_atomic_helper.h>
+#include <drm/drm_gem_framebuffer_helper.h>
+#include <drm/drm_gem_shmem_helper.h>
+#include <drm/drm_plane_helper.h>
+#include <drm/drm_simple_kms_helper.h>
+
 #define EBC_DSP_START			0x0000
 #define EBC_DSP_START_DSP_OUT_LOW		BIT(31)
 #define EBC_DSP_START_DSP_SDCE_WIDTH(x)		((x) << 16)
@@ -118,9 +129,331 @@ struct rockchip_ebc {
 	struct clk			*dclk;
 	struct clk			*hclk;
 	struct completion		display_end;
+	struct drm_crtc			crtc;
+	struct drm_device		drm;
+	struct drm_encoder		encoder;
+	struct drm_plane		plane;
 	struct regmap			*regmap;
 	struct regulator_bulk_data	supplies[EBC_NUM_SUPPLIES];
 };
+
+DEFINE_DRM_GEM_FOPS(rockchip_ebc_fops);
+
+static const struct drm_driver rockchip_ebc_drm_driver = {
+	.lastclose		= drm_fb_helper_lastclose,
+	DRM_GEM_SHMEM_DRIVER_OPS,
+	.major			= 0,
+	.minor			= 3,
+	.name			= "rockchip-ebc",
+	.desc			= "Rockchip E-Book Controller",
+	.date			= "20220303",
+	.driver_features	= DRIVER_ATOMIC | DRIVER_GEM | DRIVER_MODESET,
+	.fops			= &rockchip_ebc_fops,
+};
+
+static const struct drm_mode_config_funcs rockchip_ebc_mode_config_funcs = {
+	.fb_create		= drm_gem_fb_create_with_dirty,
+	.atomic_check		= drm_atomic_helper_check,
+	.atomic_commit		= drm_atomic_helper_commit,
+};
+
+/*
+ * CRTC
+ */
+
+struct ebc_crtc_state {
+	struct drm_crtc_state		base;
+};
+
+static inline struct ebc_crtc_state *
+to_ebc_crtc_state(struct drm_crtc_state *crtc_state)
+{
+	return container_of(crtc_state, struct ebc_crtc_state, base);
+}
+
+static inline struct rockchip_ebc *crtc_to_ebc(struct drm_crtc *crtc)
+{
+	return container_of(crtc, struct rockchip_ebc, crtc);
+}
+
+static void rockchip_ebc_crtc_mode_set_nofb(struct drm_crtc *crtc)
+{
+}
+
+static int rockchip_ebc_crtc_atomic_check(struct drm_crtc *crtc,
+					  struct drm_atomic_state *state)
+{
+	return 0;
+}
+
+static void rockchip_ebc_crtc_atomic_flush(struct drm_crtc *crtc,
+					   struct drm_atomic_state *state)
+{
+}
+
+static void rockchip_ebc_crtc_atomic_enable(struct drm_crtc *crtc,
+					    struct drm_atomic_state *state)
+{
+}
+
+static void rockchip_ebc_crtc_atomic_disable(struct drm_crtc *crtc,
+					     struct drm_atomic_state *state)
+{
+}
+
+static const struct drm_crtc_helper_funcs rockchip_ebc_crtc_helper_funcs = {
+	.mode_set_nofb		= rockchip_ebc_crtc_mode_set_nofb,
+	.atomic_check		= rockchip_ebc_crtc_atomic_check,
+	.atomic_flush		= rockchip_ebc_crtc_atomic_flush,
+	.atomic_enable		= rockchip_ebc_crtc_atomic_enable,
+	.atomic_disable		= rockchip_ebc_crtc_atomic_disable,
+};
+
+static void rockchip_ebc_crtc_destroy_state(struct drm_crtc *crtc,
+					    struct drm_crtc_state *crtc_state);
+
+static void rockchip_ebc_crtc_reset(struct drm_crtc *crtc)
+{
+	struct ebc_crtc_state *ebc_crtc_state;
+
+	if (crtc->state)
+		rockchip_ebc_crtc_destroy_state(crtc, crtc->state);
+
+	ebc_crtc_state = kzalloc(sizeof(*ebc_crtc_state), GFP_KERNEL);
+	if (!ebc_crtc_state)
+		return;
+
+	__drm_atomic_helper_crtc_reset(crtc, &ebc_crtc_state->base);
+}
+
+static struct drm_crtc_state *
+rockchip_ebc_crtc_duplicate_state(struct drm_crtc *crtc)
+{
+	struct ebc_crtc_state *ebc_crtc_state;
+
+	if (!crtc->state)
+		return NULL;
+
+	ebc_crtc_state = kzalloc(sizeof(*ebc_crtc_state), GFP_KERNEL);
+	if (!ebc_crtc_state)
+		return NULL;
+
+	__drm_atomic_helper_crtc_duplicate_state(crtc, &ebc_crtc_state->base);
+
+	return &ebc_crtc_state->base;
+}
+
+static void rockchip_ebc_crtc_destroy_state(struct drm_crtc *crtc,
+					    struct drm_crtc_state *crtc_state)
+{
+	struct ebc_crtc_state *ebc_crtc_state = to_ebc_crtc_state(crtc_state);
+
+	__drm_atomic_helper_crtc_destroy_state(&ebc_crtc_state->base);
+
+	kfree(ebc_crtc_state);
+}
+
+static const struct drm_crtc_funcs rockchip_ebc_crtc_funcs = {
+	.reset			= rockchip_ebc_crtc_reset,
+	.destroy		= drm_crtc_cleanup,
+	.set_config		= drm_atomic_helper_set_config,
+	.page_flip		= drm_atomic_helper_page_flip,
+	.atomic_duplicate_state	= rockchip_ebc_crtc_duplicate_state,
+	.atomic_destroy_state	= rockchip_ebc_crtc_destroy_state,
+};
+
+/*
+ * Plane
+ */
+
+struct ebc_plane_state {
+	struct drm_shadow_plane_state	base;
+};
+
+static inline struct ebc_plane_state *
+to_ebc_plane_state(struct drm_plane_state *plane_state)
+{
+	return container_of(plane_state, struct ebc_plane_state, base.base);
+}
+
+static inline struct rockchip_ebc *plane_to_ebc(struct drm_plane *plane)
+{
+	return container_of(plane, struct rockchip_ebc, plane);
+}
+
+static int rockchip_ebc_plane_atomic_check(struct drm_plane *plane,
+					   struct drm_atomic_state *state)
+{
+	struct drm_plane_state *plane_state;
+	struct drm_crtc_state *crtc_state;
+	int ret;
+
+	plane_state = drm_atomic_get_new_plane_state(state, plane);
+	if (!plane_state->crtc)
+		return 0;
+
+	crtc_state = drm_atomic_get_new_crtc_state(state, plane_state->crtc);
+	ret = drm_atomic_helper_check_plane_state(plane_state, crtc_state,
+						  DRM_PLANE_HELPER_NO_SCALING,
+						  DRM_PLANE_HELPER_NO_SCALING,
+						  true, true);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+static void rockchip_ebc_plane_atomic_update(struct drm_plane *plane,
+					     struct drm_atomic_state *state)
+{
+}
+
+static const struct drm_plane_helper_funcs rockchip_ebc_plane_helper_funcs = {
+	.prepare_fb		= drm_gem_prepare_shadow_fb,
+	.cleanup_fb		= drm_gem_cleanup_shadow_fb,
+	.atomic_check		= rockchip_ebc_plane_atomic_check,
+	.atomic_update		= rockchip_ebc_plane_atomic_update,
+};
+
+static void rockchip_ebc_plane_destroy_state(struct drm_plane *plane,
+					     struct drm_plane_state *plane_state);
+
+static void rockchip_ebc_plane_reset(struct drm_plane *plane)
+{
+	struct ebc_plane_state *ebc_plane_state;
+
+	if (plane->state)
+		rockchip_ebc_plane_destroy_state(plane, plane->state);
+
+	ebc_plane_state = kzalloc(sizeof(*ebc_plane_state), GFP_KERNEL);
+	if (!ebc_plane_state)
+		return;
+
+	__drm_gem_reset_shadow_plane(plane, &ebc_plane_state->base);
+}
+
+static struct drm_plane_state *
+rockchip_ebc_plane_duplicate_state(struct drm_plane *plane)
+{
+	struct ebc_plane_state *ebc_plane_state;
+
+	if (!plane->state)
+		return NULL;
+
+	ebc_plane_state = kzalloc(sizeof(*ebc_plane_state), GFP_KERNEL);
+	if (!ebc_plane_state)
+		return NULL;
+
+	__drm_gem_duplicate_shadow_plane_state(plane, &ebc_plane_state->base);
+
+	return &ebc_plane_state->base.base;
+}
+
+static void rockchip_ebc_plane_destroy_state(struct drm_plane *plane,
+					     struct drm_plane_state *plane_state)
+{
+	struct ebc_plane_state *ebc_plane_state = to_ebc_plane_state(plane_state);
+
+	__drm_gem_destroy_shadow_plane_state(&ebc_plane_state->base);
+
+	kfree(ebc_plane_state);
+}
+
+static const struct drm_plane_funcs rockchip_ebc_plane_funcs = {
+	.update_plane		= drm_atomic_helper_update_plane,
+	.disable_plane		= drm_atomic_helper_disable_plane,
+	.destroy		= drm_plane_cleanup,
+	.reset			= rockchip_ebc_plane_reset,
+	.atomic_duplicate_state	= rockchip_ebc_plane_duplicate_state,
+	.atomic_destroy_state	= rockchip_ebc_plane_destroy_state,
+};
+
+static const u32 rockchip_ebc_plane_formats[] = {
+	DRM_FORMAT_XRGB8888,
+};
+
+static const u64 rockchip_ebc_plane_format_modifiers[] = {
+	DRM_FORMAT_MOD_LINEAR,
+	DRM_FORMAT_MOD_INVALID
+};
+
+static int rockchip_ebc_drm_init(struct rockchip_ebc *ebc)
+{
+	struct drm_device *drm = &ebc->drm;
+	struct drm_bridge *bridge;
+	int ret;
+
+	ret = drmm_mode_config_init(drm);
+	if (ret)
+		return ret;
+
+	drm->mode_config.max_width = DRM_SHADOW_PLANE_MAX_WIDTH;
+	drm->mode_config.max_height = DRM_SHADOW_PLANE_MAX_HEIGHT;
+	drm->mode_config.funcs = &rockchip_ebc_mode_config_funcs;
+	drm->mode_config.quirk_addfb_prefer_host_byte_order = true;
+
+	drm_plane_helper_add(&ebc->plane, &rockchip_ebc_plane_helper_funcs);
+	ret = drm_universal_plane_init(drm, &ebc->plane, 0,
+				       &rockchip_ebc_plane_funcs,
+				       rockchip_ebc_plane_formats,
+				       ARRAY_SIZE(rockchip_ebc_plane_formats),
+				       rockchip_ebc_plane_format_modifiers,
+				       DRM_PLANE_TYPE_PRIMARY, NULL);
+	if (ret)
+		return ret;
+
+	drm_plane_enable_fb_damage_clips(&ebc->plane);
+
+	drm_crtc_helper_add(&ebc->crtc, &rockchip_ebc_crtc_helper_funcs);
+	ret = drm_crtc_init_with_planes(drm, &ebc->crtc, &ebc->plane, NULL,
+					&rockchip_ebc_crtc_funcs, NULL);
+	if (ret)
+		return ret;
+
+	ebc->encoder.possible_crtcs = drm_crtc_mask(&ebc->crtc);
+	ret = drm_simple_encoder_init(drm, &ebc->encoder, DRM_MODE_ENCODER_NONE);
+	if (ret)
+		return ret;
+
+	bridge = devm_drm_of_get_bridge(drm->dev, drm->dev->of_node, 0, 0);
+	if (IS_ERR(bridge))
+		return PTR_ERR(bridge);
+
+	ret = drm_bridge_attach(&ebc->encoder, bridge, NULL, 0);
+	if (ret)
+		return ret;
+
+	drm_mode_config_reset(drm);
+
+	ret = drm_dev_register(drm, 0);
+	if (ret)
+		return ret;
+
+	drm_fbdev_generic_setup(drm, 0);
+
+	return 0;
+}
+
+static int __maybe_unused rockchip_ebc_suspend(struct device *dev)
+{
+	struct rockchip_ebc *ebc = dev_get_drvdata(dev);
+	int ret;
+
+	ret = drm_mode_config_helper_suspend(&ebc->drm);
+	if (ret)
+		return ret;
+
+	return pm_runtime_force_suspend(dev);
+}
+
+static int __maybe_unused rockchip_ebc_resume(struct device *dev)
+{
+	struct rockchip_ebc *ebc = dev_get_drvdata(dev);
+
+	pm_runtime_force_resume(dev);
+
+	return drm_mode_config_helper_resume(&ebc->drm);
+}
 
 static int rockchip_ebc_runtime_suspend(struct device *dev)
 {
@@ -173,6 +506,7 @@ err_disable_supplies:
 }
 
 static const struct dev_pm_ops rockchip_ebc_dev_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(rockchip_ebc_suspend, rockchip_ebc_resume)
 	SET_RUNTIME_PM_OPS(rockchip_ebc_runtime_suspend,
 			   rockchip_ebc_runtime_resume, NULL)
 };
@@ -230,9 +564,10 @@ static int rockchip_ebc_probe(struct platform_device *pdev)
 	void __iomem *base;
 	int i, ret;
 
-	ebc = devm_kzalloc(dev, sizeof(*ebc), GFP_KERNEL);
-	if (!ebc)
-		return -ENOMEM;
+	ebc = devm_drm_dev_alloc(dev, &rockchip_ebc_drm_driver,
+				 struct rockchip_ebc, drm);
+	if (IS_ERR(ebc))
+		return PTR_ERR(ebc);
 
 	platform_set_drvdata(pdev, ebc);
 	init_completion(&ebc->display_end);
@@ -279,12 +614,27 @@ static int rockchip_ebc_probe(struct platform_device *pdev)
 			return ret;
 	}
 
+	ret = rockchip_ebc_drm_init(ebc);
+	if (ret)
+		goto err_disable_pm;
+
 	return 0;
+
+err_disable_pm:
+	pm_runtime_disable(dev);
+	if (!pm_runtime_status_suspended(dev))
+		rockchip_ebc_runtime_suspend(dev);
+
+	return ret;
 }
 
 static int rockchip_ebc_remove(struct platform_device *pdev)
 {
+	struct rockchip_ebc *ebc = platform_get_drvdata(pdev);
 	struct device *dev = &pdev->dev;
+
+	drm_dev_unregister(&ebc->drm);
+	drm_atomic_helper_shutdown(&ebc->drm);
 
 	pm_runtime_disable(dev);
 	if (!pm_runtime_status_suspended(dev))
@@ -295,7 +645,10 @@ static int rockchip_ebc_remove(struct platform_device *pdev)
 
 static void rockchip_ebc_shutdown(struct platform_device *pdev)
 {
+	struct rockchip_ebc *ebc = platform_get_drvdata(pdev);
 	struct device *dev = &pdev->dev;
+
+	drm_atomic_helper_shutdown(&ebc->drm);
 
 	if (!pm_runtime_status_suspended(dev))
 		rockchip_ebc_runtime_suspend(dev);
