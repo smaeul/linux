@@ -109,6 +109,8 @@ endif
 config DRM_ROCKCHIP_EBC
 	tristate "DRM Support for Rockchip EBC"
 	depends on DRM
+	select DRM_GEM_SHMEM_HELPER
+	select DRM_KMS_HELPER
 	select REGMAP_MMIO
 	help
 	  This selects DRM/KMS support for the Rockchip E-Book Controller (EBC).
