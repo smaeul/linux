@@ -135,6 +135,7 @@ struct rockchip_ebc {
 	struct drm_plane		plane;
 	struct regmap			*regmap;
 	struct regulator_bulk_data	supplies[EBC_NUM_SUPPLIES];
+	u32				dsp_start;
 };
 
 DEFINE_DRM_GEM_FOPS(rockchip_ebc_fops);
@@ -178,11 +179,112 @@ static inline struct rockchip_ebc *crtc_to_ebc(struct drm_crtc *crtc)
 
 static void rockchip_ebc_crtc_mode_set_nofb(struct drm_crtc *crtc)
 {
+	struct rockchip_ebc *ebc = crtc_to_ebc(crtc);
+	struct drm_display_mode mode = crtc->state->adjusted_mode;
+	struct drm_display_mode sdck;
+	u16 hsync_width, vsync_width;
+	u16 hact_start, vact_start;
+	u16 pixels_per_sdck;
+	bool bus_16bit;
+
+	/*
+	 * Hardware needs horizontal timings in SDCK (source driver clock)
+	 * cycles, not pixels. Bus width is either 8 bits (normal) or 16 bits
+	 * (DRM_MODE_FLAG_CLKDIV2), and each pixel uses two data bits.
+	 */
+	bus_16bit = !!(mode.flags & DRM_MODE_FLAG_CLKDIV2);
+	pixels_per_sdck = bus_16bit ? 8 : 4;
+	sdck.hdisplay = mode.hdisplay / pixels_per_sdck;
+	sdck.hsync_start = mode.hsync_start / pixels_per_sdck;
+	sdck.hsync_end = mode.hsync_end / pixels_per_sdck;
+	sdck.htotal = mode.htotal / pixels_per_sdck;
+	sdck.hskew = mode.hskew / pixels_per_sdck;
+
+	/*
+	 * Linux timing order is display/fp/sync/bp. Hardware timing order is
+	 * sync/bp/display/fp, aka sync/start/display/end.
+	 */
+	hact_start = sdck.htotal - sdck.hsync_start;
+	vact_start = mode.vtotal - mode.vsync_start;
+
+	hsync_width = sdck.hsync_end - sdck.hsync_start;
+	vsync_width = mode.vsync_end - mode.vsync_start;
+
+	clk_set_rate(ebc->dclk, mode.clock * 1000);
+
+	ebc->dsp_start = EBC_DSP_START_DSP_SDCE_WIDTH(sdck.hdisplay) |
+			 EBC_DSP_START_SW_BURST_CTRL;
+	regmap_write(ebc->regmap, EBC_EPD_CTRL,
+		     EBC_EPD_CTRL_DSP_GD_END(sdck.htotal - sdck.hskew) |
+		     EBC_EPD_CTRL_DSP_GD_ST(hsync_width + sdck.hskew) |
+		     EBC_EPD_CTRL_DSP_SDDW_MODE * bus_16bit);
+	regmap_write(ebc->regmap, EBC_DSP_CTRL,
+		     /* no swap */
+		     EBC_DSP_CTRL_DSP_SWAP_MODE(bus_16bit ? 2 : 3) |
+		     EBC_DSP_CTRL_DSP_SDCLK_DIV(pixels_per_sdck - 1));
+	regmap_write(ebc->regmap, EBC_DSP_HTIMING0,
+		     EBC_DSP_HTIMING0_DSP_HTOTAL(sdck.htotal) |
+		     /* sync end == sync width */
+		     EBC_DSP_HTIMING0_DSP_HS_END(hsync_width));
+	regmap_write(ebc->regmap, EBC_DSP_HTIMING1,
+		     EBC_DSP_HTIMING1_DSP_HACT_END(hact_start + sdck.hdisplay) |
+		     /* minus 1 for fixed delay in timing sequence */
+		     EBC_DSP_HTIMING1_DSP_HACT_ST(hact_start - 1));
+	regmap_write(ebc->regmap, EBC_DSP_VTIMING0,
+		     EBC_DSP_VTIMING0_DSP_VTOTAL(mode.vtotal) |
+		     /* sync end == sync width */
+		     EBC_DSP_VTIMING0_DSP_VS_END(vsync_width));
+	regmap_write(ebc->regmap, EBC_DSP_VTIMING1,
+		     EBC_DSP_VTIMING1_DSP_VACT_END(vact_start + mode.vdisplay) |
+		     EBC_DSP_VTIMING1_DSP_VACT_ST(vact_start));
+	regmap_write(ebc->regmap, EBC_DSP_ACT_INFO,
+		     EBC_DSP_ACT_INFO_DSP_HEIGHT(mode.vdisplay) |
+		     EBC_DSP_ACT_INFO_DSP_WIDTH(mode.hdisplay));
+	regmap_write(ebc->regmap, EBC_WIN_CTRL,
+		     /* FIFO depth - 16 */
+		     EBC_WIN_CTRL_WIN2_FIFO_THRESHOLD(496) |
+		     EBC_WIN_CTRL_WIN_EN |
+		     /* INCR16 */
+		     EBC_WIN_CTRL_AHB_BURST_REG(7) |
+		     /* FIFO depth - 16 */
+		     EBC_WIN_CTRL_WIN_FIFO_THRESHOLD(240) |
+		     EBC_WIN_CTRL_WIN_FMT_Y4);
+
+	/* To keep things simple, always use a window size matching the CRTC. */
+	regmap_write(ebc->regmap, EBC_WIN_VIR,
+		     EBC_WIN_VIR_WIN_VIR_HEIGHT(mode.vdisplay) |
+		     EBC_WIN_VIR_WIN_VIR_WIDTH(mode.hdisplay));
+	regmap_write(ebc->regmap, EBC_WIN_ACT,
+		     EBC_WIN_ACT_WIN_ACT_HEIGHT(mode.vdisplay) |
+		     EBC_WIN_ACT_WIN_ACT_WIDTH(mode.hdisplay));
+	regmap_write(ebc->regmap, EBC_WIN_DSP,
+		     EBC_WIN_DSP_WIN_DSP_HEIGHT(mode.vdisplay) |
+		     EBC_WIN_DSP_WIN_DSP_WIDTH(mode.hdisplay));
+	regmap_write(ebc->regmap, EBC_WIN_DSP_ST,
+		     EBC_WIN_DSP_ST_WIN_DSP_YST(vact_start) |
+		     EBC_WIN_DSP_ST_WIN_DSP_XST(hact_start));
 }
 
 static int rockchip_ebc_crtc_atomic_check(struct drm_crtc *crtc,
 					  struct drm_atomic_state *state)
 {
+	struct rockchip_ebc *ebc = crtc_to_ebc(crtc);
+	struct drm_crtc_state *crtc_state;
+
+	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+	if (!crtc_state->mode_changed)
+		return 0;
+
+	if (crtc_state->enable) {
+		struct drm_display_mode *mode = &crtc_state->adjusted_mode;
+		long rate = mode->clock * 1000;
+
+		rate = clk_round_rate(ebc->dclk, rate);
+		if (rate < 0)
+			return rate;
+		mode->clock = rate / 1000;
+	}
+
 	return 0;
 }
 
