@@ -127,6 +127,7 @@
 #define EBC_NUM_LUT_REGS		0x1000
 #define EBC_NUM_SUPPLIES		3
 
+#define EBC_REFRESH_TIMEOUT		msecs_to_jiffies(3000)
 #define EBC_SUSPEND_DELAY_MS		2000
 
 struct rockchip_ebc {
@@ -324,6 +325,9 @@ static void rockchip_ebc_refresh(struct rockchip_ebc *ebc,
 				  ebc->lut.buf, EBC_NUM_LUT_REGS);
 	}
 
+	regmap_write(ebc->regmap, EBC_DSP_START,
+		     ebc->dsp_start);
+
 	for (;;) {
 		u32 win_start, win_bytes;
 		struct drm_rect win;
@@ -358,13 +362,43 @@ static void rockchip_ebc_refresh(struct rockchip_ebc *ebc,
 		dma_sync_single_for_device(dev, ctx->prev_dma + win_start,
 					   win_bytes, DMA_TO_DEVICE);
 
-		/* Refresh the display. */
+		regmap_write(ebc->regmap, EBC_WIN_MST0,
+			     ctx->next_dma + win_start);
+		regmap_write(ebc->regmap, EBC_WIN_MST1,
+			     ctx->prev_dma + win_start);
+		regmap_write(ebc->regmap, EBC_WIN_VIR,
+			     EBC_WIN_VIR_WIN_VIR_HEIGHT(drm_rect_height(&win)) |
+			     EBC_WIN_VIR_WIN_VIR_WIDTH(ctx->gray4_pitch * 2));
+		regmap_write(ebc->regmap, EBC_WIN_ACT,
+			     EBC_WIN_ACT_WIN_ACT_HEIGHT(drm_rect_height(&win)) |
+			     EBC_WIN_ACT_WIN_ACT_WIDTH(drm_rect_width(&win)));
+		regmap_write(ebc->regmap, EBC_WIN_DSP,
+			     EBC_WIN_DSP_WIN_DSP_HEIGHT(drm_rect_height(&win)) |
+			     EBC_WIN_DSP_WIN_DSP_WIDTH(drm_rect_width(&win)));
+		regmap_write(ebc->regmap, EBC_WIN_DSP_ST,
+			     EBC_WIN_DSP_ST_WIN_DSP_YST(ebc->vact_start + win.y1) |
+			     EBC_WIN_DSP_ST_WIN_DSP_XST(ebc->hact_start + win.x1 / 8));
+		regmap_write(ebc->regmap, EBC_CONFIG_DONE,
+			     EBC_CONFIG_DONE_REG_CONFIG_DONE);
+		regmap_write(ebc->regmap, EBC_DSP_START,
+			     ebc->dsp_start |
+			     EBC_DSP_START_DSP_FRM_TOTAL(ebc->lut.num_phases - 1) |
+			     EBC_DSP_START_DSP_FRM_START);
+
+		if (!wait_for_completion_timeout(&ebc->display_end,
+						 EBC_REFRESH_TIMEOUT))
+			drm_err(drm, "Refresh timed out!\n");
 
 		memcpy(ctx->prev + win_start, ctx->next + win_start, win_bytes);
 
 		if (refresh_type == CLEAR_SCREEN)
 			break;
 	}
+
+	/* Drive the output pins low once the refresh is complete. */
+	regmap_write(ebc->regmap, EBC_DSP_START,
+		     ebc->dsp_start |
+		     EBC_DSP_START_DSP_OUT_LOW);
 
 	pm_runtime_mark_last_busy(dev);
 	pm_runtime_put_autosuspend(dev);
