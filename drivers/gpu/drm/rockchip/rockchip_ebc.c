@@ -127,6 +127,7 @@
 #define EBC_NUM_LUT_REGS		0x1000
 #define EBC_NUM_SUPPLIES		3
 
+#define EBC_REFRESH_TIMEOUT		msecs_to_jiffies(3000)
 #define EBC_SUSPEND_DELAY_MS		2000
 
 struct rockchip_ebc {
@@ -269,8 +270,23 @@ static void rockchip_ebc_global_refresh(struct rockchip_ebc *ebc,
 {
 	struct drm_device *drm = &ebc->drm;
 	u32 gray4_size = ctx->gray4_size;
+	struct device *dev = drm->dev;
 
-	drm_dbg(drm, "global refresh\n");
+	dma_sync_single_for_device(dev, virt_to_phys(ctx->next),
+				   gray4_size, DMA_TO_DEVICE);
+	dma_sync_single_for_device(dev, virt_to_phys(ctx->prev),
+				   gray4_size, DMA_TO_DEVICE);
+
+	reinit_completion(&ebc->display_end);
+	regmap_write(ebc->regmap, EBC_CONFIG_DONE,
+		     EBC_CONFIG_DONE_REG_CONFIG_DONE);
+	regmap_write(ebc->regmap, EBC_DSP_START,
+		     ebc->dsp_start |
+		     EBC_DSP_START_DSP_FRM_TOTAL(ebc->lut.num_phases - 1) |
+		     EBC_DSP_START_DSP_FRM_START);
+	if (!wait_for_completion_timeout(&ebc->display_end,
+					 EBC_REFRESH_TIMEOUT))
+		drm_err(drm, "Refresh timed out!\n");
 
 	memcpy(ctx->prev, ctx->next, gray4_size);
 }
@@ -289,6 +305,7 @@ static void rockchip_ebc_refresh(struct rockchip_ebc *ebc,
 				 enum drm_epd_waveform waveform)
 {
 	struct drm_device *drm = &ebc->drm;
+	u32 dsp_ctrl = 0, epd_ctrl = 0;
 	struct device *dev = drm->dev;
 	int ret, temperature;
 
@@ -334,10 +351,39 @@ static void rockchip_ebc_refresh(struct rockchip_ebc *ebc,
 				  ebc->lut.buf, EBC_NUM_LUT_REGS);
 	}
 
+	regmap_write(ebc->regmap, EBC_DSP_START,
+		     ebc->dsp_start);
+
+	/*
+	 * The hardware has a separate bit for each mode, with some priority
+	 * scheme between them. For clarity, only set one bit at a time.
+	 */
+	if (global_refresh) {
+		dsp_ctrl |= EBC_DSP_CTRL_DSP_LUT_MODE;
+	} else {
+		epd_ctrl |= EBC_EPD_CTRL_DSP_THREE_WIN_MODE;
+	}
+	regmap_update_bits(ebc->regmap, EBC_EPD_CTRL,
+			   EBC_EPD_CTRL_DSP_THREE_WIN_MODE,
+			   epd_ctrl);
+	regmap_update_bits(ebc->regmap, EBC_DSP_CTRL,
+			   EBC_DSP_CTRL_DSP_LUT_MODE,
+			   dsp_ctrl);
+
+	regmap_write(ebc->regmap, EBC_WIN_MST0,
+		     virt_to_phys(ctx->next));
+	regmap_write(ebc->regmap, EBC_WIN_MST1,
+		     virt_to_phys(ctx->prev));
+
 	if (global_refresh)
 		rockchip_ebc_global_refresh(ebc, ctx);
 	else
 		rockchip_ebc_partial_refresh(ebc, ctx);
+
+	/* Drive the output pins low once the refresh is complete. */
+	regmap_write(ebc->regmap, EBC_DSP_START,
+		     ebc->dsp_start |
+		     EBC_DSP_START_DSP_OUT_LOW);
 
 	pm_runtime_mark_last_busy(dev);
 	pm_runtime_put_autosuspend(dev);
