@@ -17,6 +17,7 @@
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_bridge.h>
 #include <drm/drm_drv.h>
+#include <drm/drm_epd_helper.h>
 #include <drm/drm_fb_helper.h>
 #include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
@@ -121,6 +122,7 @@
 #define EBC_WIN_MST2			0x0058
 #define EBC_LUT_DATA			0x1000
 
+#define EBC_MAX_PHASES			256
 #define EBC_NUM_LUT_REGS		0x1000
 #define EBC_NUM_SUPPLIES		3
 
@@ -133,6 +135,8 @@ struct rockchip_ebc {
 	struct drm_crtc			crtc;
 	struct drm_device		drm;
 	struct drm_encoder		encoder;
+	struct drm_epd_lut		lut;
+	struct drm_epd_lut_file		lut_file;
 	struct drm_plane		plane;
 	struct regmap			*regmap;
 	struct regulator_bulk_data	supplies[EBC_NUM_SUPPLIES];
@@ -140,8 +144,13 @@ struct rockchip_ebc {
 	u32				dsp_start;
 	u16				hact_start;
 	u16				vact_start;
+	bool				lut_changed;
 	bool				reset_complete;
 };
+
+static int default_waveform = DRM_EPD_WF_GC16;
+module_param(default_waveform, int, 0644);
+MODULE_PARM_DESC(default_waveform, "waveform to use for display updates");
 
 static bool skip_reset;
 module_param(skip_reset, bool, 0444);
@@ -181,6 +190,54 @@ to_ebc_crtc_state(struct drm_crtc_state *crtc_state)
 	return container_of(crtc_state, struct ebc_crtc_state, base);
 }
 
+enum ebc_refresh_type {
+	CLEAR_SCREEN,
+	GLOBAL_REFRESH,
+};
+
+static void rockchip_ebc_refresh(struct rockchip_ebc *ebc,
+				 enum ebc_refresh_type refresh_type,
+				 enum drm_epd_waveform waveform)
+{
+	struct drm_device *drm = &ebc->drm;
+	struct device *dev = drm->dev;
+	int ret;
+
+	/* Resume asynchronously while preparing to refresh. */
+	ret = pm_runtime_get(dev);
+	if (ret < 0) {
+		drm_err(drm, "Failed to request resume: %d\n", ret);
+		return;
+	}
+
+	ret = drm_epd_lut_set_waveform(&ebc->lut, waveform);
+	if (ret < 0)
+		drm_err(drm, "Failed to set LUT waveform: %d\n", ret);
+	else if (ret)
+		ebc->lut_changed = true;
+
+	/* Wait for the resume to complete before writing any registers. */
+	ret = pm_runtime_resume(dev);
+	if (ret < 0) {
+		drm_err(drm, "Failed to resume: %d\n", ret);
+		pm_runtime_put(dev);
+		return;
+	}
+
+	/* This flag may have been set above, or by the runtime PM callback. */
+	if (ebc->lut_changed) {
+		ebc->lut_changed = false;
+		regmap_bulk_write(ebc->regmap, EBC_LUT_DATA,
+				  ebc->lut.buf, EBC_NUM_LUT_REGS);
+	}
+
+
+	/* Refresh the display. */
+
+	pm_runtime_mark_last_busy(dev);
+	pm_runtime_put_autosuspend(dev);
+}
+
 static int rockchip_ebc_refresh_thread(void *data)
 {
 	struct rockchip_ebc *ebc = data;
@@ -194,10 +251,13 @@ static int rockchip_ebc_refresh_thread(void *data)
 		 */
 		if (!ebc->reset_complete) {
 			ebc->reset_complete = true;
+			rockchip_ebc_refresh(ebc, CLEAR_SCREEN,
+					     DRM_EPD_WF_RESET);
 		}
 
 		while (!kthread_should_park()) {
-			/* Refresh the display. */
+			rockchip_ebc_refresh(ebc, GLOBAL_REFRESH,
+					     default_waveform);
 
 			set_current_state(TASK_IDLE);
 			schedule();
@@ -208,6 +268,8 @@ static int rockchip_ebc_refresh_thread(void *data)
 		 * Clear the display before disabling the CRTC. Use the
 		 * highest-quality waveform to minimize visible artifacts.
 		 */
+		rockchip_ebc_refresh(ebc, CLEAR_SCREEN, DRM_EPD_WF_GC16);
+
 		kthread_parkme();
 	}
 
@@ -533,6 +595,15 @@ static int rockchip_ebc_drm_init(struct rockchip_ebc *ebc)
 	struct drm_bridge *bridge;
 	int ret;
 
+	ret = drmm_epd_lut_file_init(drm, &ebc->lut_file, "rockchip/ebc.wbf");
+	if (ret)
+		return ret;
+
+	ret = drmm_epd_lut_init(&ebc->lut_file, &ebc->lut,
+				DRM_EPD_LUT_4BIT_PACKED, EBC_MAX_PHASES);
+	if (ret)
+		return ret;
+
 	ret = drmm_mode_config_init(drm);
 	if (ret)
 		return ret;
@@ -634,6 +705,13 @@ static int rockchip_ebc_runtime_resume(struct device *dev)
 	ret = clk_prepare_enable(ebc->dclk);
 	if (ret)
 		goto err_disable_hclk;
+
+	/*
+	 * Do not restore the LUT registers here, because the temperature or
+	 * waveform may have changed since the last refresh. Instead, have the
+	 * refresh thread program the LUT during the next refresh.
+	 */
+	ebc->lut_changed = true;
 
 	regcache_cache_only(ebc->regmap, false);
 	regcache_mark_dirty(ebc->regmap);
