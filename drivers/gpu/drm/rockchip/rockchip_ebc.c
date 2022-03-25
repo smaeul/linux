@@ -5,6 +5,7 @@
 
 #include <linux/clk.h>
 #include <linux/completion.h>
+#include <linux/iio/consumer.h>
 #include <linux/irq.h>
 #include <linux/kthread.h>
 #include <linux/module.h>
@@ -122,6 +123,7 @@
 #define EBC_WIN_MST2			0x0058
 #define EBC_LUT_DATA			0x1000
 
+#define EBC_MAX_PHASES			256
 #define EBC_NUM_LUT_REGS		0x1000
 #define EBC_NUM_SUPPLIES		3
 
@@ -134,11 +136,15 @@ struct rockchip_ebc {
 	struct drm_crtc			crtc;
 	struct drm_device		drm;
 	struct drm_encoder		encoder;
+	struct drm_epd_lut		lut;
+	struct drm_epd_lut_file		lut_file;
 	struct drm_plane		plane;
+	struct iio_channel		*temperature_channel;
 	struct regmap			*regmap;
 	struct regulator_bulk_data	supplies[EBC_NUM_SUPPLIES];
 	struct task_struct		*refresh_thread;
 	u32				dsp_start;
+	bool				lut_changed;
 	bool				reset_complete;
 };
 
@@ -282,10 +288,59 @@ static void rockchip_ebc_refresh(struct rockchip_ebc *ebc,
 				 bool global_refresh,
 				 enum drm_epd_waveform waveform)
 {
+	struct drm_device *drm = &ebc->drm;
+	struct device *dev = drm->dev;
+	int ret, temperature;
+
+	/* Resume asynchronously while preparing to refresh. */
+	ret = pm_runtime_get(dev);
+	if (ret < 0) {
+		drm_err(drm, "Failed to request resume: %d\n", ret);
+		return;
+	}
+
+	ret = iio_read_channel_processed(ebc->temperature_channel, &temperature);
+	if (ret < 0) {
+		drm_err(drm, "Failed to get temperature: %d\n", ret);
+	} else {
+		/* Convert from millicelsius to celsius. */
+		temperature /= 1000;
+
+		ret = drm_epd_lut_set_temperature(&ebc->lut, temperature);
+		if (ret < 0)
+			drm_err(drm, "Failed to set LUT temperature: %d\n", ret);
+		else if (ret)
+			ebc->lut_changed = true;
+	}
+
+	ret = drm_epd_lut_set_waveform(&ebc->lut, waveform);
+	if (ret < 0)
+		drm_err(drm, "Failed to set LUT waveform: %d\n", ret);
+	else if (ret)
+		ebc->lut_changed = true;
+
+	/* Wait for the resume to complete before writing any registers. */
+	ret = pm_runtime_resume(dev);
+	if (ret < 0) {
+		drm_err(drm, "Failed to resume: %d\n", ret);
+		pm_runtime_put(dev);
+		return;
+	}
+
+	/* This flag may have been set above, or by the runtime PM callback. */
+	if (ebc->lut_changed) {
+		ebc->lut_changed = false;
+		regmap_bulk_write(ebc->regmap, EBC_LUT_DATA,
+				  ebc->lut.buf, EBC_NUM_LUT_REGS);
+	}
+
 	if (global_refresh)
 		rockchip_ebc_global_refresh(ebc, ctx);
 	else
 		rockchip_ebc_partial_refresh(ebc, ctx);
+
+	pm_runtime_mark_last_busy(dev);
+	pm_runtime_put_autosuspend(dev);
 }
 
 static int rockchip_ebc_refresh_thread(void *data)
@@ -708,6 +763,15 @@ static int rockchip_ebc_drm_init(struct rockchip_ebc *ebc)
 	struct drm_bridge *bridge;
 	int ret;
 
+	ret = drmm_epd_lut_file_init(drm, &ebc->lut_file, "rockchip/ebc.wbf");
+	if (ret)
+		return ret;
+
+	ret = drmm_epd_lut_init(&ebc->lut_file, &ebc->lut,
+				DRM_EPD_LUT_4BIT_PACKED, EBC_MAX_PHASES);
+	if (ret)
+		return ret;
+
 	ret = drmm_mode_config_init(drm);
 	if (ret)
 		return ret;
@@ -809,6 +873,13 @@ static int rockchip_ebc_runtime_resume(struct device *dev)
 	ret = clk_prepare_enable(ebc->dclk);
 	if (ret)
 		goto err_disable_hclk;
+
+	/*
+	 * Do not restore the LUT registers here, because the temperature or
+	 * waveform may have changed since the last refresh. Instead, have the
+	 * refresh thread program the LUT during the next refresh.
+	 */
+	ebc->lut_changed = true;
 
 	regcache_cache_only(ebc->regmap, false);
 	regcache_mark_dirty(ebc->regmap);
@@ -918,6 +989,11 @@ static int rockchip_ebc_probe(struct platform_device *pdev)
 	if (IS_ERR(ebc->hclk))
 		return dev_err_probe(dev, PTR_ERR(ebc->hclk),
 				     "Failed to get hclk\n");
+
+	ebc->temperature_channel = devm_iio_channel_get(dev, NULL);
+	if (IS_ERR(ebc->temperature_channel))
+		return dev_err_probe(dev, PTR_ERR(ebc->temperature_channel),
+				     "Failed to get temperature I/O channel\n");
 
 	for (i = 0; i < EBC_NUM_SUPPLIES; i++)
 		ebc->supplies[i].supply = rockchip_ebc_supplies[i];
