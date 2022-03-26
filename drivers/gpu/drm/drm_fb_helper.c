@@ -688,7 +688,8 @@ static void drm_fb_helper_memory_range_to_clip(struct fb_info *info, off_t off, 
 	u32 x1 = 0;
 	u32 y1 = off / info->fix.line_length;
 	u32 x2 = info->var.xres;
-	u32 y2 = DIV_ROUND_UP(end, info->fix.line_length);
+	u32 y2 = min_t(u32, DIV_ROUND_UP(end, info->fix.line_length),
+		       info->var.yres);
 
 	if ((y2 - y1) == 1) {
 		/*
