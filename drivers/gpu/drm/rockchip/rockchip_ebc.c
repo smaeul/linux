@@ -166,6 +166,10 @@ static bool direct_mode = true;
 module_param(direct_mode, bool, 0444);
 MODULE_PARM_DESC(direct_mode, "compute waveforms in software (software LUT)");
 
+static bool panel_reflection = true;
+module_param(panel_reflection, bool, 0644);
+MODULE_PARM_DESC(panel_reflection, "reflect the image horizontally");
+
 static bool skip_reset;
 module_param(skip_reset, bool, 0444);
 MODULE_PARM_DESC(skip_reset, "skip the initial display reset");
@@ -1046,22 +1050,28 @@ static bool rockchip_ebc_blit_fb(const struct rockchip_ebc_ctx *ctx,
 {
 	unsigned int dst_pitch = ctx->gray4_pitch;
 	unsigned int src_pitch = fb->pitches[0];
-	unsigned int x, y;
+	unsigned int start_x, x, y;
 	const void *src;
 	u8 changed = 0;
+	int delta_x;
 	void *dst;
 
+	delta_x = panel_reflection ? -1 : 1;
+	start_x = panel_reflection ? src_clip->x2 - 1 : src_clip->x1;
+
 	dst = ctx->final + dst_clip->y1 * dst_pitch + dst_clip->x1 / 2;
-	src = vaddr + src_clip->y1 * src_pitch + src_clip->x1 * fb->format->cpp[0];
+	src = vaddr + src_clip->y1 * src_pitch + start_x * fb->format->cpp[0];
 
 	for (y = src_clip->y1; y < src_clip->y2; y++) {
 		const u32 *sbuf = src;
 		u8 *dbuf = dst;
 
 		for (x = src_clip->x1; x < src_clip->x2; x += 2) {
-			u32 rgb0 = *sbuf++;
-			u32 rgb1 = *sbuf++;
+			u32 rgb0, rgb1;
 			u8 gray;
+
+			rgb0 = *sbuf; sbuf += delta_x;
+			rgb1 = *sbuf; sbuf += delta_x;
 
 			/* Truncate the RGB values to 5 bits each. */
 			rgb0 &= 0x00f8f8f8U; rgb1 &= 0x00f8f8f8U;
@@ -1135,6 +1145,13 @@ static void rockchip_ebc_plane_atomic_update(struct drm_plane *plane,
 			adjust = dst_clip->x2 & 1;
 		dst_clip->x2 += adjust;
 		src_clip.x2  += adjust;
+
+		if (panel_reflection) {
+			int x1 = dst_clip->x1, x2 = dst_clip->x2;
+
+			dst_clip->x1 = plane_state->dst.x2 - x2;
+			dst_clip->x2 = plane_state->dst.x2 - x1;
+		}
 
 		if (!rockchip_ebc_blit_fb(ctx, dst_clip, vaddr,
 					  plane_state->fb, &src_clip)) {
