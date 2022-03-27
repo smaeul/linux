@@ -162,6 +162,10 @@ static bool diff_mode = true;
 module_param(diff_mode, bool, 0644);
 MODULE_PARM_DESC(diff_mode, "only compute waveforms for changed pixels");
 
+static bool direct_mode = true;
+module_param(direct_mode, bool, 0444);
+MODULE_PARM_DESC(direct_mode, "compute waveforms in software (software LUT)");
+
 static bool skip_reset;
 module_param(skip_reset, bool, 0444);
 MODULE_PARM_DESC(skip_reset, "skip the initial display reset");
@@ -370,6 +374,59 @@ static bool rockchip_ebc_schedule_area(struct list_head *areas,
 	return true;
 }
 
+static void rockchip_ebc_blit_direct(const struct rockchip_ebc_ctx *ctx,
+				     u8 *dst, u8 phase,
+				     const struct drm_epd_lut *lut,
+				     const struct drm_rect *clip)
+{
+	const u32 *phase_lut = (const u32 *)lut->buf + 16 * phase;
+	unsigned int dst_pitch = ctx->phase_pitch / 4;
+	unsigned int src_pitch = ctx->gray4_pitch;
+	unsigned int x, y;
+	u8 *dst_line;
+	u32 src_line;
+
+	dst_line = dst + clip->y1 * dst_pitch + clip->x1 / 4;
+	src_line = clip->y1 * src_pitch + clip->x1 / 2;
+
+	for (y = clip->y1; y < clip->y2; y++) {
+		u32 src_offset = src_line;
+		u8 *dbuf = dst_line;
+
+		for (x = clip->x1; x < clip->x2; x += 4) {
+			u8 prev0 = ctx->prev[src_offset];
+			u8 next0 = ctx->next[src_offset++];
+			u8 prev1 = ctx->prev[src_offset];
+			u8 next1 = ctx->next[src_offset++];
+
+			/*
+			 * The LUT is 256 phases * 16 next * 16 previous levels.
+			 * Each value is two bits, so the last dimension neatly
+			 * fits in a 32-bit word.
+			 */
+			u8 data = ((phase_lut[next0 & 0xf] >> ((prev0 & 0xf) << 1)) & 0x3) << 0 |
+				  ((phase_lut[next0 >>  4] >> ((prev0 >>  4) << 1)) & 0x3) << 2 |
+				  ((phase_lut[next1 & 0xf] >> ((prev1 & 0xf) << 1)) & 0x3) << 4 |
+				  ((phase_lut[next1 >>  4] >> ((prev1 >>  4) << 1)) & 0x3) << 6;
+
+			/* Diff mode ignores pixels that did not change brightness. */
+			if (diff_mode) {
+				u8 mask = ((next0 ^ prev0) & 0x0f ? 0x03 : 0) |
+					  ((next0 ^ prev0) & 0xf0 ? 0x0c : 0) |
+					  ((next1 ^ prev1) & 0x0f ? 0x30 : 0) |
+					  ((next1 ^ prev1) & 0xf0 ? 0xc0 : 0);
+
+				data &= mask;
+			}
+
+			*dbuf++ = data;
+		}
+
+		dst_line += dst_pitch;
+		src_line += src_pitch;
+	}
+}
+
 static void rockchip_ebc_blit_phase(const struct rockchip_ebc_ctx *ctx,
 				    u8 *dst, u8 phase,
 				    const struct drm_rect *clip)
@@ -472,8 +529,13 @@ static void rockchip_ebc_partial_refresh(struct rockchip_ebc *ebc,
 			 * be neutral for every waveform.
 			 */
 			phase = frame_delta >= last_phase ? 0xff : frame_delta;
-			rockchip_ebc_blit_phase(ctx, phase_buffer, phase,
-						&area->clip);
+			if (direct_mode)
+				rockchip_ebc_blit_direct(ctx, phase_buffer,
+							 phase, &ebc->lut,
+							 &area->clip);
+			else
+				rockchip_ebc_blit_phase(ctx, phase_buffer,
+							phase, &area->clip);
 
 			/*
 			 * Copy ctx->next to ctx->prev after the last phase.
@@ -513,7 +575,8 @@ static void rockchip_ebc_partial_refresh(struct rockchip_ebc *ebc,
 		if (list_empty(&areas))
 			break;
 
-		regmap_write(ebc->regmap, EBC_WIN_MST2,
+		regmap_write(ebc->regmap,
+			     direct_mode ? EBC_WIN_MST0 : EBC_WIN_MST2,
 			     phase_handle);
 		regmap_write(ebc->regmap, EBC_CONFIG_DONE,
 			     EBC_CONFIG_DONE_REG_CONFIG_DONE);
@@ -581,10 +644,12 @@ static void rockchip_ebc_refresh(struct rockchip_ebc *ebc,
 	/*
 	 * The hardware has a separate bit for each mode, with some priority
 	 * scheme between them. For clarity, only set one bit at a time.
+	 *
+	 * NOTE: In direct mode, no mode bits are set.
 	 */
 	if (global_refresh) {
 		dsp_ctrl |= EBC_DSP_CTRL_DSP_LUT_MODE;
-	} else {
+	} else if (!direct_mode) {
 		epd_ctrl |= EBC_EPD_CTRL_DSP_THREE_WIN_MODE;
 		if (diff_mode)
 			dsp_ctrl |= EBC_DSP_CTRL_DSP_DIFF_MODE;
@@ -647,8 +712,12 @@ static int rockchip_ebc_refresh_thread(void *data)
 		 */
 		memset(ctx->prev, 0xff, ctx->gray4_size);
 		memset(ctx->next, 0xff, ctx->gray4_size);
-		memset(ctx->phase[0], 0xff, ctx->phase_size);
-		memset(ctx->phase[1], 0xff, ctx->phase_size);
+		/*
+		 * NOTE: In direct mode, the phase buffers are repurposed for
+		 * source driver polarity data, where the no-op value is 0.
+		 */
+		memset(ctx->phase[0], direct_mode ? 0 : 0xff, ctx->phase_size);
+		memset(ctx->phase[1], direct_mode ? 0 : 0xff, ctx->phase_size);
 
 		/*
 		 * LUTs use both the old and the new pixel values as inputs.
@@ -1048,12 +1117,22 @@ static void rockchip_ebc_plane_atomic_update(struct drm_plane *plane,
 		/* Convert from plane coordinates to CRTC coordinates. */
 		drm_rect_translate(dst_clip, translate_x, translate_y);
 
-		/* Adjust the clips to always process full bytes (2 pixels). */
-		adjust = dst_clip->x1 & 1;
+		/*
+		 * Adjust the clips to always process full bytes (2 pixels).
+		 *
+		 * NOTE: in direct mode, the minimum block size is 4 pixels.
+		 */
+		if (direct_mode)
+			adjust = dst_clip->x1 & 3;
+		else
+			adjust = dst_clip->x1 & 1;
 		dst_clip->x1 -= adjust;
 		src_clip.x1  -= adjust;
 
-		adjust = dst_clip->x2 & 1;
+		if (direct_mode)
+			adjust = ((dst_clip->x2 + 3) ^ 3) & 3;
+		else
+			adjust = dst_clip->x2 & 1;
 		dst_clip->x2 += adjust;
 		src_clip.x2  += adjust;
 
