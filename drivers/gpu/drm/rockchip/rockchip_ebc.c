@@ -157,6 +157,10 @@ static int default_waveform = DRM_EPD_WF_GC16;
 module_param(default_waveform, int, 0644);
 MODULE_PARM_DESC(default_waveform, "waveform to use for display updates");
 
+static bool diff_mode = true;
+module_param(diff_mode, bool, 0644);
+MODULE_PARM_DESC(diff_mode, "only compute waveforms for changed pixels");
+
 static bool skip_reset;
 module_param(skip_reset, bool, 0444);
 MODULE_PARM_DESC(skip_reset, "skip the initial display reset");
@@ -319,6 +323,7 @@ static void rockchip_ebc_refresh(struct rockchip_ebc *ebc,
 	struct drm_display_mode *mode = &ebc->crtc.state->adjusted_mode;
 	struct drm_device *drm = &ebc->drm;
 	struct device *dev = drm->dev;
+	unsigned int dsp_ctrl = 0;
 	int ret;
 
 	/* Resume asynchronously while preparing to refresh. */
@@ -351,6 +356,12 @@ static void rockchip_ebc_refresh(struct rockchip_ebc *ebc,
 
 	regmap_write(ebc->regmap, EBC_DSP_START,
 		     ebc->dsp_start);
+
+	if (refresh_type != CLEAR_SCREEN && diff_mode)
+		dsp_ctrl |= EBC_DSP_CTRL_DSP_DIFF_MODE;
+	regmap_update_bits(ebc->regmap, EBC_DSP_CTRL,
+			   EBC_DSP_CTRL_DSP_DIFF_MODE,
+			   dsp_ctrl);
 
 	for (;;) {
 		u32 win_start, win_bytes;
