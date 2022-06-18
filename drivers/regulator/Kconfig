@@ -1338,6 +1338,15 @@ config REGULATOR_TPS65132
 	  This driver supports TPS65132 single inductor - dual output
 	  power supply specifically designed for display panels.
 
+config REGULATOR_TPS65185
+	tristate "TI TPS65185 PMIC for E-Paper Display"
+	depends on GPIOLIB && I2C && IIO
+	select IIO_TRIGGERED_EVENT
+	select REGMAP_I2C
+	help
+	  This driver supports the voltage regulators on the TPS65185 PMIC
+	  specifically designed for e-paper display panels.
+
 config REGULATOR_TPS65217
 	tristate "TI TPS65217 Power regulators"
 	depends on MFD_TPS65217
