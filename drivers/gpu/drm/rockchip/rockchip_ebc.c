@@ -13,10 +13,12 @@
 #include <linux/pm_runtime.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
+#include <linux/slab.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_bridge.h>
+#include <drm/drm_damage_helper.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_epd_helper.h>
 #include <drm/drm_fb_helper.h>
@@ -140,6 +142,7 @@ struct rockchip_ebc {
 	struct drm_epd_lut		lut;
 	struct drm_epd_lut_file		lut_file;
 	struct drm_plane		plane;
+	struct kmem_cache		*area_cache;
 	struct regmap			*regmap;
 	struct regulator_bulk_data	supplies[EBC_NUM_SUPPLIES];
 	struct task_struct		*refresh_thread;
@@ -177,6 +180,26 @@ static const struct drm_mode_config_funcs rockchip_ebc_mode_config_funcs = {
 	.atomic_check		= drm_atomic_helper_check,
 	.atomic_commit		= drm_atomic_helper_commit,
 };
+
+/**
+ * struct rockchip_ebc_area - describes a damaged area of the display
+ *
+ * @list: Used to put this area in the state/context/refresh thread list
+ * @clip: The rectangular clip of this damage area
+ */
+struct rockchip_ebc_area {
+	struct list_head		list;
+	struct drm_rect			clip;
+};
+
+static void rockchip_ebc_free_areas(struct rockchip_ebc *ebc,
+				    struct list_head *areas)
+{
+	struct rockchip_ebc_area *area, *next;
+
+	list_for_each_entry_safe(area, next, areas, list)
+		kmem_cache_free(ebc->area_cache, area);
+}
 
 /**
  * struct rockchip_ebc_ctx - context for performing display refreshes
@@ -264,6 +287,7 @@ static void rockchip_ebc_ctx_release(struct kref *kref)
 	dma_free_noncoherent(dev, ctx->gray4_size, ctx->next,
 			     ctx->next_dma, DMA_TO_DEVICE);
 	kfree(ctx->final);
+	rockchip_ebc_free_areas(ctx->ebc, &ctx->areas);
 	kfree(ctx);
 }
 
@@ -331,6 +355,7 @@ static void rockchip_ebc_refresh(struct rockchip_ebc *ebc,
 	for (;;) {
 		u32 win_start, win_bytes;
 		struct drm_rect win;
+		LIST_HEAD(areas);
 
 		if (refresh_type == CLEAR_SCREEN) {
 			win = (struct drm_rect) {
@@ -342,12 +367,32 @@ static void rockchip_ebc_refresh(struct rockchip_ebc *ebc,
 
 			memset(ctx->next + win_start, 0xff, win_bytes);
 		} else if (refresh_type == GLOBAL_REFRESH) {
+			struct drm_rect win = { width, height, 0, 0 };
+			struct rockchip_ebc_area *area;
+
+			/* Consume the list of damaged areas before copying final. */
+			spin_lock(&ctx->areas_lock);
+			list_splice_tail_init(&ctx->areas, &areas);
+			spin_unlock(&ctx->areas_lock);
+
 			if (list_empty(&ctx->areas))
 				break;
 
 			win = (struct drm_rect) {
 				mode->hdisplay, mode->vdisplay, 0, 0
 			};
+
+			list_for_each_entry(area, &areas, list) {
+				win.x1 = min(win.x1, area->clip.x1);
+				win.y1 = min(win.y1, area->clip.y1);
+				win.x2 = max(win.x2, area->clip.x2);
+				win.y2 = max(win.y2, area->clip.y2);
+			}
+
+			/* Must start/end on a clock cycle boundary. */
+			win.x1 &= ~7;
+			win.x2 +=  7;
+			win.x2 &= ~7;
 
 			win_start = win.y1 * ctx->gray4_pitch + win.x1 / 2;
 			win_bytes = (drm_rect_height(&win) - 1) * ctx->gray4_pitch +
@@ -384,6 +429,9 @@ static void rockchip_ebc_refresh(struct rockchip_ebc *ebc,
 			     ebc->dsp_start |
 			     EBC_DSP_START_DSP_FRM_TOTAL(ebc->lut.num_phases - 1) |
 			     EBC_DSP_START_DSP_FRM_START);
+
+		/* Free the areas while waiting for the hardware to finish. */
+		rockchip_ebc_free_areas(ebc, &areas);
 
 		if (!wait_for_completion_timeout(&ebc->display_end,
 						 EBC_REFRESH_TIMEOUT))
@@ -678,6 +726,7 @@ static const struct drm_crtc_funcs rockchip_ebc_crtc_funcs = {
 
 struct ebc_plane_state {
 	struct drm_shadow_plane_state	base;
+	struct list_head		areas;
 };
 
 static inline struct ebc_plane_state *
@@ -694,8 +743,13 @@ static inline struct rockchip_ebc *plane_to_ebc(struct drm_plane *plane)
 static int rockchip_ebc_plane_atomic_check(struct drm_plane *plane,
 					   struct drm_atomic_state *state)
 {
-	struct drm_plane_state *plane_state;
+	struct drm_plane_state *old_plane_state, *plane_state;
+	struct rockchip_ebc *ebc = plane_to_ebc(plane);
+	struct drm_atomic_helper_damage_iter iter;
+	struct ebc_plane_state *ebc_plane_state;
 	struct drm_crtc_state *crtc_state;
+	struct rockchip_ebc_area *area;
+	struct drm_rect clip;
 	int ret;
 
 	plane_state = drm_atomic_get_new_plane_state(state, plane);
@@ -710,18 +764,129 @@ static int rockchip_ebc_plane_atomic_check(struct drm_plane *plane,
 	if (ret)
 		return ret;
 
+	ebc_plane_state = to_ebc_plane_state(plane_state);
+	old_plane_state = drm_atomic_get_old_plane_state(state, plane);
+	drm_atomic_helper_damage_iter_init(&iter, old_plane_state, plane_state);
+	drm_atomic_for_each_plane_damage(&iter, &clip) {
+		area = kmem_cache_alloc(ebc->area_cache, GFP_KERNEL);
+		if (!area)
+			return -ENOMEM;
+
+		area->clip = clip;
+		list_add_tail(&area->list, &ebc_plane_state->areas);
+	}
+
 	return 0;
+}
+
+static bool rockchip_ebc_blit_fb(const struct rockchip_ebc_ctx *ctx,
+				 const struct drm_rect *dst_clip,
+				 const void *vaddr,
+				 const struct drm_framebuffer *fb,
+				 const struct drm_rect *src_clip)
+{
+	unsigned int dst_pitch = ctx->gray4_pitch;
+	unsigned int src_pitch = fb->pitches[0];
+	unsigned int x, y;
+	const void *src;
+	u8 changed = 0;
+	void *dst;
+
+	dst = ctx->final + dst_clip->y1 * dst_pitch + dst_clip->x1 / 2;
+	src = vaddr      + src_clip->y1 * src_pitch + src_clip->x1;
+
+	for (y = src_clip->y1; y < src_clip->y2; y++) {
+		const u8 *sbuf = src;
+		u8 *dbuf = dst;
+
+		x = dst_clip->x1 / 2;
+
+		if (dst_clip->x1 % 2) {
+			u8 hi = *sbuf++;
+			u8 old = *dbuf;
+			u8 out;
+
+			out = (old & 0xf) | (hi & 0xf0);
+			changed |= out ^ old;
+			*dbuf++ = out;
+			x++;
+		}
+
+		for (; x < dst_clip->x2 / 2; x++) {
+			u8 lo = *sbuf++;
+			u8 hi = *sbuf++;
+			u8 out;
+
+			out = (lo >> 4) | (hi & 0xf0);
+			changed |= out ^ *dbuf;
+			*dbuf++ = out;
+		}
+
+		if (dst_clip->x2 % 2) {
+			u8 lo = *sbuf++;
+			u8 old = *dbuf;
+			u8 out;
+
+			out = (lo >> 4) | (old & 0xf0);
+			changed |= out ^ old;
+			*dbuf++ = out;
+		}
+
+		dst += dst_pitch;
+		src += src_pitch;
+	}
+
+	return !!changed;
 }
 
 static void rockchip_ebc_plane_atomic_update(struct drm_plane *plane,
 					     struct drm_atomic_state *state)
 {
 	struct rockchip_ebc *ebc = plane_to_ebc(plane);
+	struct ebc_plane_state *ebc_plane_state;
+	struct rockchip_ebc_area *area, *next;
 	struct drm_plane_state *plane_state;
+	struct drm_crtc_state *crtc_state;
+	struct rockchip_ebc_ctx *ctx;
+	int translate_x, translate_y;
+	struct drm_rect src;
+	const void *vaddr;
 
 	plane_state = drm_atomic_get_new_plane_state(state, plane);
 	if (!plane_state->crtc)
 		return;
+
+	crtc_state = drm_atomic_get_new_crtc_state(state, plane_state->crtc);
+	ctx = to_ebc_crtc_state(crtc_state)->ctx;
+
+	drm_rect_fp_to_int(&src, &plane_state->src);
+	translate_x = plane_state->dst.x1 - src.x1;
+	translate_y = plane_state->dst.y1 - src.y1;
+
+	ebc_plane_state = to_ebc_plane_state(plane_state);
+	vaddr = ebc_plane_state->base.data[0].vaddr;
+
+	list_for_each_entry_safe(area, next, &ebc_plane_state->areas, list) {
+		struct drm_rect *dst_clip = &area->clip;
+		struct drm_rect src_clip = area->clip;
+
+		/* Convert from plane coordinates to CRTC coordinates. */
+		drm_rect_translate(dst_clip, translate_x, translate_y);
+
+		if (!rockchip_ebc_blit_fb(ctx, dst_clip, vaddr,
+					  plane_state->fb, &src_clip)) {
+			/* Drop the area if the FB didn't actually change. */
+			list_del(&area->list);
+			kmem_cache_free(ebc->area_cache, area);
+		}
+	}
+
+	if (list_empty(&ebc_plane_state->areas))
+		return;
+
+	spin_lock(&ctx->areas_lock);
+	list_splice_tail_init(&ebc_plane_state->areas, &ctx->areas);
+	spin_unlock(&ctx->areas_lock);
 
 	wake_up_process(ebc->refresh_thread);
 }
@@ -748,6 +913,8 @@ static void rockchip_ebc_plane_reset(struct drm_plane *plane)
 		return;
 
 	__drm_gem_reset_shadow_plane(plane, &ebc_plane_state->base);
+
+	INIT_LIST_HEAD(&ebc_plane_state->areas);
 }
 
 static struct drm_plane_state *
@@ -764,6 +931,8 @@ rockchip_ebc_plane_duplicate_state(struct drm_plane *plane)
 
 	__drm_gem_duplicate_shadow_plane_state(plane, &ebc_plane_state->base);
 
+	INIT_LIST_HEAD(&ebc_plane_state->areas);
+
 	return &ebc_plane_state->base.base;
 }
 
@@ -771,6 +940,9 @@ static void rockchip_ebc_plane_destroy_state(struct drm_plane *plane,
 					     struct drm_plane_state *plane_state)
 {
 	struct ebc_plane_state *ebc_plane_state = to_ebc_plane_state(plane_state);
+	struct rockchip_ebc *ebc = plane_to_ebc(plane);
+
+	rockchip_ebc_free_areas(ebc, &ebc_plane_state->areas);
 
 	__drm_gem_destroy_shadow_plane_state(&ebc_plane_state->base);
 
@@ -1049,13 +1221,19 @@ static int rockchip_ebc_probe(struct platform_device *pdev)
 			return ret;
 	}
 
+	ebc->area_cache = KMEM_CACHE(rockchip_ebc_area, 0);
+	if (!ebc->area_cache) {
+		ret = -ENOMEM;
+		goto err_disable_pm;
+	}
+
 	ebc->refresh_thread = kthread_create(rockchip_ebc_refresh_thread,
 					     ebc, "ebc-refresh/%s",
 					     dev_name(dev));
 	if (IS_ERR(ebc->refresh_thread)) {
 		ret = dev_err_probe(dev, PTR_ERR(ebc->refresh_thread),
 				    "Failed to start refresh thread\n");
-		goto err_disable_pm;
+		goto err_destroy_cache;
 	}
 
 	kthread_park(ebc->refresh_thread);
@@ -1069,6 +1247,8 @@ static int rockchip_ebc_probe(struct platform_device *pdev)
 
 err_stop_kthread:
 	kthread_stop(ebc->refresh_thread);
+err_destroy_cache:
+	kmem_cache_destroy(ebc->area_cache);
 err_disable_pm:
 	pm_runtime_disable(dev);
 	if (!pm_runtime_status_suspended(dev))
