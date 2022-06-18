@@ -105,3 +105,15 @@ config ROCKCHIP_RK3066_HDMI
 	  for the RK3066 HDMI driver. If you want to enable
 	  HDMI on RK3066 based SoC, you should select this option.
 endif
+
+config DRM_ROCKCHIP_EBC
+	tristate "DRM Support for Rockchip EBC"
+	depends on DRM && IIO
+	select DRM_EPD_HELPER
+	select DRM_GEM_SHMEM_HELPER
+	select DRM_KMS_HELPER
+	help
+	  This selects DRM/KMS support for the Rockchip E-Book Controller (EBC).
+	  Choose this option if you have a Rockchip SoC and an electrophoretic
+	  display. This hardware and driver is separate from the normal Rockchip
+	  display hardware and DRM driver.

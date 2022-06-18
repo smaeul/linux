@@ -72,6 +72,16 @@
 		};
 	};
 
+	panel {
+		compatible = "eink,ed103tc2";
+
+		port {
+			panel_in_ebc: endpoint {
+				remote-endpoint = <&ebc_out_panel>;
+			};
+		};
+	};
+
 	sdio_pwrseq: sdio-pwrseq {
 		compatible = "mmc-pwrseq-simple";
 		clocks = <&rk817 1>;
@@ -211,6 +221,20 @@
 
 &cpu3 {
 	cpu-supply = <&vdd_cpu>;
+};
+
+&ebc {
+	io-channels = <&ebc_pmic 0>;
+	panel-supply = <&v3p3>;
+	vcom-supply = <&vcom>;
+	vdrive-supply = <&vdrive>;
+	status = "okay";
+
+	port {
+		ebc_out_panel: endpoint {
+			remote-endpoint = <&panel_in_ebc>;
+		};
+	};
 };
 
 &i2c0 {
@@ -499,6 +523,47 @@
 			};
 		};
 	};
+
+	/* TODO: write binding */
+	ebc_pmic: pmic@68 {
+		compatible = "ti,tps65185";
+		reg = <0x68>;
+		interrupt-parent = <&gpio3>;
+		interrupts = <RK_PA6 IRQ_TYPE_LEVEL_LOW>;
+		#io-channel-cells = <1>;
+		pinctrl-0 = <&ebc_pmic_pins>;
+		pinctrl-names = "default";
+		powerup-gpios = <&gpio3 RK_PB0 GPIO_ACTIVE_HIGH>;
+		pwr_good-gpios = <&gpio3 RK_PA7 GPIO_ACTIVE_HIGH>;
+		vcom_ctrl-gpios = <&gpio4 RK_PB2 GPIO_ACTIVE_HIGH>;
+		vin-supply = <&vcc_bat>;
+		vin3p3-supply = <&vcc_3v3>;
+		wakeup-gpios = <&gpio3 RK_PA5 GPIO_ACTIVE_HIGH>;
+		ti,up-sequence = <1>, <0>, <2>, <3>;
+		ti,up-delay-ms = <3>, <3>, <3>, <3>;
+		ti,down-sequence = <2>, <3>, <1>, <0>;
+		ti,down-delay-ms = <3>, <6>, <6>, <6>;
+
+		regulators {
+			v3p3: v3p3 {
+				regulator-name = "v3p3";
+				regulator-always-on;
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3300000>;
+			};
+
+			vcom: vcom {
+				regulator-name = "vcom";
+				/* voltage range is board-specific */
+			};
+
+			vdrive: vdrive {
+				regulator-name = "vdrive";
+				regulator-min-microvolt = <15000000>;
+				regulator-max-microvolt = <15000000>;
+			};
+		};
+	};
 };
 
 &i2c5 {
@@ -560,6 +625,21 @@
 
 		bt_wake_h: bt-wake-h {
 			rockchip,pins = <0 RK_PC2 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	ebc-pmic {
+		ebc_pmic_pins: ebc-pmic-pins {
+			rockchip,pins = /* wakeup */
+					<3 RK_PA5 RK_FUNC_GPIO &pcfg_pull_none>,
+					/* int */
+					<3 RK_PA6 RK_FUNC_GPIO &pcfg_pull_up>,
+					/* pwr_good */
+					<3 RK_PA7 RK_FUNC_GPIO &pcfg_pull_none>,
+					/* pwrup */
+					<3 RK_PB0 RK_FUNC_GPIO &pcfg_pull_none>,
+					/* vcom_ctrl */
+					<4 RK_PB2 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 	};
 

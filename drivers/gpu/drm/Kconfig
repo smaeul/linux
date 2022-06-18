@@ -171,6 +171,12 @@ config DRM_LOAD_EDID_FIRMWARE
 
 source "drivers/gpu/drm/display/Kconfig"
 
+config DRM_EPD_HELPER
+	tristate
+	depends on DRM
+	help
+	  Choose this if you need the EPD (LUT, etc.) helper functions
+
 config DRM_TTM
 	tristate
 	depends on DRM && MMU
