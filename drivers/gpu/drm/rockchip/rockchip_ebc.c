@@ -5,6 +5,7 @@
 
 #include <linux/clk.h>
 #include <linux/completion.h>
+#include <linux/dma-mapping.h>
 #include <linux/irq.h>
 #include <linux/kthread.h>
 #include <linux/module.h>
@@ -176,12 +177,102 @@ static const struct drm_mode_config_funcs rockchip_ebc_mode_config_funcs = {
 	.atomic_commit		= drm_atomic_helper_commit,
 };
 
+/**
+ * struct rockchip_ebc_ctx - context for performing display refreshes
+ *
+ * @kref: Reference count, maintained as part of the CRTC's atomic state
+ * @areas: Queue of damaged areas to be refreshed
+ * @areas_lock: Lock protecting access to @areas
+ * @ebc: EBC device owning this context
+ * @final: Display contents (Y4) after all pending refreshes
+ * @next: Display contents (Y4) after this refresh
+ * @prev: Display contents (Y4) before this refresh
+ * @next_dma: DMA address for @next buffer
+ * @prev_dma: DMA address for @prev buffer
+ * @gray4_pitch: Horizontal line length of a Y4 pixel buffer in bytes
+ * @gray4_size: Size of a Y4 pixel buffer in bytes
+ */
+struct rockchip_ebc_ctx {
+	struct kref			kref;
+	struct list_head		areas;
+	spinlock_t			areas_lock;
+	struct rockchip_ebc		*ebc;
+	u8				*final;
+	u8				*next;
+	u8				*prev;
+	dma_addr_t			next_dma;
+	dma_addr_t			prev_dma;
+	u32				gray4_pitch;
+	u32				gray4_size;
+};
+
+static struct rockchip_ebc_ctx *rockchip_ebc_ctx_alloc(struct rockchip_ebc *ebc,
+						       u32 width, u32 height)
+{
+	struct device *dev = ebc->drm.dev;
+	struct rockchip_ebc_ctx *ctx;
+
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx)
+		return NULL;
+
+	kref_init(&ctx->kref);
+	INIT_LIST_HEAD(&ctx->areas);
+	spin_lock_init(&ctx->areas_lock);
+	ctx->ebc = ebc;
+	ctx->gray4_pitch = width / 2;
+	ctx->gray4_size  = ctx->gray4_pitch * height;
+
+	ctx->final = kmalloc(ctx->gray4_size, GFP_KERNEL);
+	if (!ctx->final)
+		goto err_free_ctx;
+
+	ctx->next = dma_alloc_noncoherent(dev, ctx->gray4_size,
+					  &ctx->next_dma,
+					  DMA_TO_DEVICE, GFP_KERNEL);
+	if (!ctx->next)
+		goto err_free_final;
+
+	ctx->prev = dma_alloc_noncoherent(dev, ctx->gray4_size,
+					  &ctx->prev_dma,
+					  DMA_TO_DEVICE, GFP_KERNEL);
+	if (!ctx->prev)
+		goto err_free_next;
+
+	return ctx;
+
+err_free_next:
+	dma_free_noncoherent(dev, ctx->gray4_size, ctx->next,
+			     ctx->next_dma, DMA_TO_DEVICE);
+err_free_final:
+	kfree(ctx->final);
+err_free_ctx:
+	kfree(ctx);
+
+	return NULL;
+}
+
+static void rockchip_ebc_ctx_release(struct kref *kref)
+{
+	struct rockchip_ebc_ctx *ctx =
+		container_of(kref, struct rockchip_ebc_ctx, kref);
+	struct device *dev = ctx->ebc->drm.dev;
+
+	dma_free_noncoherent(dev, ctx->gray4_size, ctx->prev,
+			     ctx->prev_dma, DMA_TO_DEVICE);
+	dma_free_noncoherent(dev, ctx->gray4_size, ctx->next,
+			     ctx->next_dma, DMA_TO_DEVICE);
+	kfree(ctx->final);
+	kfree(ctx);
+}
+
 /*
  * CRTC
  */
 
 struct ebc_crtc_state {
 	struct drm_crtc_state		base;
+	struct rockchip_ebc_ctx		*ctx;
 };
 
 static inline struct ebc_crtc_state *
@@ -196,9 +287,11 @@ enum ebc_refresh_type {
 };
 
 static void rockchip_ebc_refresh(struct rockchip_ebc *ebc,
+				 struct rockchip_ebc_ctx *ctx,
 				 enum ebc_refresh_type refresh_type,
 				 enum drm_epd_waveform waveform)
 {
+	struct drm_display_mode *mode = &ebc->crtc.state->adjusted_mode;
 	struct drm_device *drm = &ebc->drm;
 	struct device *dev = drm->dev;
 	int ret;
@@ -231,8 +324,47 @@ static void rockchip_ebc_refresh(struct rockchip_ebc *ebc,
 				  ebc->lut.buf, EBC_NUM_LUT_REGS);
 	}
 
+	for (;;) {
+		u32 win_start, win_bytes;
+		struct drm_rect win;
 
-	/* Refresh the display. */
+		if (refresh_type == CLEAR_SCREEN) {
+			win = (struct drm_rect) {
+				0, 0, mode->hdisplay, mode->vdisplay
+			};
+
+			win_start = 0;
+			win_bytes = ctx->gray4_size;
+
+			memset(ctx->next + win_start, 0xff, win_bytes);
+		} else if (refresh_type == GLOBAL_REFRESH) {
+			if (list_empty(&ctx->areas))
+				break;
+
+			win = (struct drm_rect) {
+				mode->hdisplay, mode->vdisplay, 0, 0
+			};
+
+			win_start = win.y1 * ctx->gray4_pitch + win.x1 / 2;
+			win_bytes = (drm_rect_height(&win) - 1) * ctx->gray4_pitch +
+				    drm_rect_width(&win) / 2;
+
+			memcpy(ctx->next + win_start, ctx->final + win_start,
+			       win_bytes);
+		}
+
+		dma_sync_single_for_device(dev, ctx->next_dma + win_start,
+					   win_bytes, DMA_TO_DEVICE);
+		dma_sync_single_for_device(dev, ctx->prev_dma + win_start,
+					   win_bytes, DMA_TO_DEVICE);
+
+		/* Refresh the display. */
+
+		memcpy(ctx->prev + win_start, ctx->next + win_start, win_bytes);
+
+		if (refresh_type == CLEAR_SCREEN)
+			break;
+	}
 
 	pm_runtime_mark_last_busy(dev);
 	pm_runtime_put_autosuspend(dev);
@@ -241,8 +373,12 @@ static void rockchip_ebc_refresh(struct rockchip_ebc *ebc,
 static int rockchip_ebc_refresh_thread(void *data)
 {
 	struct rockchip_ebc *ebc = data;
+	struct rockchip_ebc_ctx *ctx;
 
 	while (!kthread_should_stop()) {
+		/* The context will change each time the thread is unparked. */
+		ctx = to_ebc_crtc_state(READ_ONCE(ebc->crtc.state))->ctx;
+
 		/*
 		 * LUTs use both the old and the new pixel values as inputs.
 		 * However, the initial contents of the display are unknown.
@@ -251,16 +387,32 @@ static int rockchip_ebc_refresh_thread(void *data)
 		 */
 		if (!ebc->reset_complete) {
 			ebc->reset_complete = true;
-			rockchip_ebc_refresh(ebc, CLEAR_SCREEN,
+			rockchip_ebc_refresh(ebc, ctx, CLEAR_SCREEN,
 					     DRM_EPD_WF_RESET);
+		} else {
+			/*
+			 * Initialize the buffers before use. This is deferred
+			 * to the kthread to avoid slowing down atomic_check.
+			 *
+			 * ctx->final is initialized by the first plane update.
+			 *
+			 * ctx->next and ctx->prev are set to 0xff because:
+			 *  1) the display is cleared to white by the reset
+			 *     waveform, and
+			 *  2) the driver maintains the invariant that the
+			 *     display is white whenever the CRTC is disabled.
+			 */
+			memset(ctx->next, 0xff, ctx->gray4_size);
+			memset(ctx->prev, 0xff, ctx->gray4_size);
 		}
 
 		while (!kthread_should_park()) {
-			rockchip_ebc_refresh(ebc, GLOBAL_REFRESH,
+			rockchip_ebc_refresh(ebc, ctx, GLOBAL_REFRESH,
 					     default_waveform);
 
 			set_current_state(TASK_IDLE);
-			schedule();
+			if (list_empty(&ctx->areas))
+				schedule();
 			__set_current_state(TASK_RUNNING);
 		}
 
@@ -268,7 +420,7 @@ static int rockchip_ebc_refresh_thread(void *data)
 		 * Clear the display before disabling the CRTC. Use the
 		 * highest-quality waveform to minimize visible artifacts.
 		 */
-		rockchip_ebc_refresh(ebc, CLEAR_SCREEN, DRM_EPD_WF_GC16);
+		rockchip_ebc_refresh(ebc, ctx, CLEAR_SCREEN, DRM_EPD_WF_GC16);
 
 		kthread_parkme();
 	}
@@ -359,7 +511,9 @@ static int rockchip_ebc_crtc_atomic_check(struct drm_crtc *crtc,
 					  struct drm_atomic_state *state)
 {
 	struct rockchip_ebc *ebc = crtc_to_ebc(crtc);
+	struct ebc_crtc_state *ebc_crtc_state;
 	struct drm_crtc_state *crtc_state;
+	struct rockchip_ebc_ctx *ctx;
 
 	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 	if (!crtc_state->mode_changed)
@@ -373,7 +527,18 @@ static int rockchip_ebc_crtc_atomic_check(struct drm_crtc *crtc,
 		if (rate < 0)
 			return rate;
 		mode->clock = rate / 1000;
+
+		ctx = rockchip_ebc_ctx_alloc(ebc, mode->hdisplay, mode->vdisplay);
+		if (!ctx)
+			return -ENOMEM;
+	} else {
+		ctx = NULL;
 	}
+
+	ebc_crtc_state = to_ebc_crtc_state(crtc_state);
+	if (ebc_crtc_state->ctx)
+		kref_put(&ebc_crtc_state->ctx->kref, rockchip_ebc_ctx_release);
+	ebc_crtc_state->ctx = ctx;
 
 	return 0;
 }
@@ -444,6 +609,10 @@ rockchip_ebc_crtc_duplicate_state(struct drm_crtc *crtc)
 
 	__drm_atomic_helper_crtc_duplicate_state(crtc, &ebc_crtc_state->base);
 
+	ebc_crtc_state->ctx = to_ebc_crtc_state(crtc->state)->ctx;
+	if (ebc_crtc_state->ctx)
+		kref_get(&ebc_crtc_state->ctx->kref);
+
 	return &ebc_crtc_state->base;
 }
 
@@ -451,6 +620,9 @@ static void rockchip_ebc_crtc_destroy_state(struct drm_crtc *crtc,
 					    struct drm_crtc_state *crtc_state)
 {
 	struct ebc_crtc_state *ebc_crtc_state = to_ebc_crtc_state(crtc_state);
+
+	if (ebc_crtc_state->ctx)
+		kref_put(&ebc_crtc_state->ctx->kref, rockchip_ebc_ctx_release);
 
 	__drm_atomic_helper_crtc_destroy_state(&ebc_crtc_state->base);
 
