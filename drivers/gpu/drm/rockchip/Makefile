@@ -18,5 +18,3 @@ rockchipdrm-$(CONFIG_ROCKCHIP_RGB) += rockchip_rgb.o
 rockchipdrm-$(CONFIG_ROCKCHIP_RK3066_HDMI) += rk3066_hdmi.o
 
 obj-$(CONFIG_DRM_ROCKCHIP) += rockchipdrm.o
-
-obj-$(CONFIG_DRM_ROCKCHIP_EBC) += rockchip_ebc.o
