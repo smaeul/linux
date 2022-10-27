@@ -83,12 +83,16 @@ void arch_setup_dma_ops(struct device *dev, u64 dma_base, u64 size,
 void riscv_init_cbom_blocksize(void)
 {
 	struct device_node *node;
-	int ret;
+	int ret, rc;
 	u32 val;
 
 	for_each_of_cpu_node(node) {
-		int hartid = riscv_of_processor_hartid(node);
+		unsigned long hartid;
 		int cbom_hartid;
+
+		rc = riscv_of_processor_hartid(node, &hartid);
+		if (!rc)
+			continue;
 
 		if (hartid < 0)
 			continue;
