@@ -79,6 +79,13 @@
 	cpu-supply = <&reg_vdd_cpu>;
 };
 
+&codec {
+	routing = "Pads", "HPOUTL",
+		"Pads", "HPOUTR";
+	widgets = "Headphone", "Pads";
+	status = "okay";
+};
+
 &de {
 	status = "okay";
 };
