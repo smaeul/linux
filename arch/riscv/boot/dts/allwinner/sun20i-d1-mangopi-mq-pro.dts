@@ -45,6 +45,12 @@
 		};
 	};
 
+	pcm5102a: pcm5102a-codec {
+		compatible = "ti,pcm5102a";
+		status = "okay";
+		#sound-dai-cells = <0>;
+	};
+
 	reg_avdd2v8: avdd2v8 {
 		compatible = "regulator-fixed";
 		regulator-name = "avdd2v8";
@@ -67,6 +73,22 @@
 		regulator-min-microvolt = <1100000>;
 		regulator-max-microvolt = <1100000>;
 		vin-supply = <&reg_vcc>;
+	};
+
+	soc {
+		sound {
+			compatible = "simple-audio-card";
+			simple-audio-card,name = "i2s";
+			simple-audio-card,format = "i2s";
+			simple-audio-card,mclk-fs = <256>;
+			status = "okay";
+			simple-audio-card,cpu {
+				sound-dai = <&i2s2>;
+			};
+			simple-audio-card,codec {
+				sound-dai = <&pcm5102a>;
+			};
+		};
 	};
 
 	wifi_pwrseq: wifi-pwrseq {
@@ -98,6 +120,12 @@
 };
 
 &hdmi_phy {
+	status = "okay";
+};
+
+&i2s2 {
+	pinctrl-0 = <&i2s2_pb567_pins>, <&i2s2_pb3_din_pin>, <&i2s2_pb4_dout_pin>;
+	pinctrl-names = "default";
 	status = "okay";
 };
 

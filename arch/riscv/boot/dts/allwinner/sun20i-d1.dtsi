@@ -159,6 +159,24 @@
 			};
 
 			/omit-if-no-ref/
+			i2s2_pb567_pins: i2s2-pb567-pins {
+				pins = "PB5", "PB6", "PB7";
+				function = "i2s2";
+			};
+
+			/omit-if-no-ref/
+			i2s2_pb3_din_pin: i2s2-pb3-din-pin {
+				pins = "PB3";
+				function = "i2s2_din";
+			};
+
+			/omit-if-no-ref/
+			i2s2_pb4_dout_pin: i2s2-pb4-dout-pin {
+				pins = "PB4";
+				function = "i2s2_dout";
+			};
+
+			/omit-if-no-ref/
 			lcd_rgb666_pins: lcd-rgb666-pins {
 				pins = "PD0", "PD1", "PD2", "PD3", "PD4", "PD5",
 				       "PD6", "PD7", "PD8", "PD9", "PD10", "PD11",
